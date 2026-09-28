@@ -1,0 +1,95 @@
+// 사용자가 올린 폰트 파일이 임베드에 쓸 수 있는 물건인지 본다. Figma·DOM 의존 금지.
+//
+// 파싱만 되면 통과시키던 시절에 새어 나간 것:
+//
+//   variable   → 굵기를 맞추거나 파일을 작게 하거나 둘 중 하나만 된다. Inter 가변으로
+//                실측(2026-08):
+//                  인스턴스 안 뽑고 서브셋   →   2KB · 굵기는 기본값(Regular) 고정
+//                  인스턴스 뽑고 서브셋      →   깨짐 (fontkit 이 DataView 로 죽는다)
+//                  인스턴스 뽑고 서브셋 없이 → 472KB · 굵기는 맞지만 236배
+//                굵기 다섯 쓰는 문서면 2.4MB 가 붙는다. 가볍게 만드는 게 목적인
+//                플러그인에서는 어느 쪽도 못 쓴다. 다시 시도하기 전에 이 숫자를 보라.
+//
+//   OTF(CFF)   → 2.2 까지 막았다. pdf-lib 이 CFF 데이터를 TrueType 라벨로 써서 뷰어가
+//                "Mismatch between font type and embedded font file" 을 냈기 때문인데,
+//                원인은 우리 fontkit 어댑터가 서브셋의 `cff` 표시를 빠뜨린 것이었다
+//                (ui/fontkitAdapter.ts). 고친 뒤 실측(STIXGeneralBol.otf): CIDFontType0 +
+//                FontFile3 로 쓰이고 poppler·Quartz 렌더, pdftotext 추출 전부 정상. 이제 받는다.
+//
+// 그래서 파일을 받기 전에 걸러내고, 무엇을 올려야 하는지 말해 준다.
+
+import { FontFileFacts, Reason } from './types'
+
+/** 검사에 필요한 만큼만 — fontkit Font 의 부분집합이라 순수 테스트가 된다. 저장 타입과 같다. */
+export type FontFacts = FontFileFacts
+
+export type FontVerdict = { ok: true } | { ok: false; reason: Reason }
+
+/**
+ * 이 파일을 임베드해도 되는가.
+ *
+ * 거절 사유는 "왜 안 되는지" 가 아니라 "그럼 뭘 올려야 하는지" 를 말하도록 문구를 짰다.
+ * 사용자는 CFF 가 뭔지 알 필요가 없다.
+ */
+export function screenFontFile(facts: FontFacts): FontVerdict {
+  const hasGlyf = facts.tables.includes('glyf')
+  // 'CFF ' 는 이름에 공백이 붙어 있다 — trim 없이 비교하면 못 잡는다
+  const hasCff = facts.tables.some((name) => name.trim() === 'CFF' || name.trim() === 'CFF2')
+
+  if (facts.axes.length > 0) {
+    return { ok: false, reason: { code: 'fontFile.variable', params: {} } }
+  }
+
+  const forbidden = embeddingForbidden(facts)
+  if (forbidden !== null) return { ok: false, reason: forbidden }
+
+  if (!hasGlyf && !hasCff) return { ok: false, reason: { code: 'fontFile.noOutlines', params: {} } }
+
+  return { ok: true }
+}
+
+/**
+ * 폰트 자신이 문서 임베드를 금지하는가(OS/2 fsType). Acrobat·Word·브라우저가 지키는 플래그다 —
+ * 폴더 스캔이 시스템·상용 폰트를 한꺼번에 끌어오게 된 뒤로는 우리도 지켜야 한다.
+ * Preview & Print 는 PDF 로 보고 인쇄하라는 허용이라 통과, Restricted 만 있는 것과 비트맵 전용은 거절.
+ * 플래그를 모르면(옛 항목) 막지 않는다.
+ */
+export function embeddingForbidden(facts: FontFacts): Reason | null {
+  if (facts.embedding === 'restricted') return { code: 'fontFile.restricted', params: {} }
+  if (facts.embedding === 'bitmap-only') return { code: 'fontFile.bitmapOnly', params: {} }
+  return null
+}
+
+/** "Version 3.019;git-0a5106e0b" → "3.019". 숫자가 없으면 undefined */
+export function parseFontVersion(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined
+  const match = /(\d+(?:\.\d+)*)/.exec(raw)
+  return match === null ? undefined : match[1]
+}
+
+/**
+ * 올린 파일이 그 자리에 맞는 굵기·기울기인가.
+ *
+ * 우리는 파일 안의 이름표가 아니라 **Figma 가 쓰는 자리**로 저장한다. Regular 파일을
+ * Bold 자리에 넣으면 Bold 라고 적힌 Regular 가 임베드된다 — 문서가 조용히 얇아진다.
+ * 막지는 않는다(파일 이름표가 틀린 경우도 있다). 대신 알려 준다.
+ */
+export function weightMismatch(
+  facts: FontFacts,
+  expected: { weight: number; italic: boolean }
+): { differs: false } | { differs: true; fileWeight: number; fileItalic: boolean } {
+  const fileWeight = facts.weightClass
+  const fileItalic = facts.italic
+  if (fileWeight === undefined || fileItalic === undefined) return { differs: false }
+
+  // 250/275 는 옛 GDI 가 250 미만을 못 다뤄 눌러 적던 관행이다 (fontCatalog 참고)
+  const tolerated =
+    expected.weight === 100
+      ? [100, 250]
+      : expected.weight === 200
+        ? [200, 250, 275]
+        : [expected.weight]
+
+  if (tolerated.includes(fileWeight) && fileItalic === expected.italic) return { differs: false }
+  return { differs: true, fileWeight, fileItalic }
+}

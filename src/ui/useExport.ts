@@ -1,0 +1,576 @@
+// 내보내기 진행 상태와 부분 PDF 수집. 다 모이면 머지해서 저장한다. (PRD §7.5)
+
+import { emit, on } from '@create-figma-plugin/utilities'
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
+
+import {
+  CancelHandler,
+  DoneHandler,
+  DoneReport,
+  ErrorHandler,
+  ExportHandler,
+  FitDirectHandler,
+  FitDirectResultHandler,
+  FitMeasuredHandler,
+  FitReport,
+  PdfPart,
+  PdfPartHandler,
+  Progress,
+  ProgressHandler,
+  Reason,
+  Settings,
+  StoredFont,
+  ToastHandler
+} from '../lib/types'
+import { formatBytes } from '../lib/fontStore'
+import { formatReason, t } from '../lib/i18n'
+import { processedImagesArePresent } from '../lib/pdfIntegrity'
+import { geometricTextOrder, workdayTextOrder } from '../lib/textOrder'
+import { forgetOriginals, ownImageSizes } from './imageCache'
+import { savedSource } from '../lib/fitToSize'
+import { downloadPdf, ImageWeight, MergeOutput, mergePdfs, OutlineCost } from './pdf'
+import { patchFitParts } from './pdfDirect'
+import { drawTextLayer, FontCache } from './textLayer'
+import { loadFontBytes } from './fontSource'
+
+export type ExportReport = {
+  fileName: string
+  byteLength: number
+  pageCount: number
+  elapsedMs: number
+  skipped: DoneReport['skipped']
+  imagesProcessed: number
+  /** 그중 보이는 창만 잘라 넣은 원본 수 */
+  imagesCropped: number
+  /** 조각을 만들다 실패해 기존 방식으로 물러선 원본 수 — 출력은 정상 */
+  imagesRecovered: number
+  textDrawn: number
+  /** 아웃라인으로 남은 텍스트 — 노드별 사유. 이미지 경고는 섞지 않는다(길이가 텍스트 수다) */
+  fallbacks: Array<{ nodeId: string; reason: Reason }>
+  /** 이미지 처리 경고 — nodeId 는 그 프레임 */
+  imageWarnings: Array<{ nodeId: string; reason: Reason }>
+  /** 텍스트 임베드를 켜고 돌았는가 — 유령 텍스트 경고는 이때만 뜻이 있다 */
+  textEmbedded: boolean
+  /** 대체 폰트로 그린 글자 — 폰트별로 모은다. 사용자가 몰라도 되는 일이 아니다 */
+  substitutions: Array<{ family: string; chars: string[] }>
+  /** 목표 용량 맞추기를 켰을 때만 있다 */
+  fit: FitReport | null
+  /** 아웃라인으로 남은 것의 무게 — Type 3 폰트 수와 벡터 바이트 */
+  outlines: OutlineCost
+  /** PDF 에 실제로 든 이미지 — 우리가 Figma 에 건넨 바이트가 아니다 */
+  images: ImageWeight
+  /** 추출될 텍스트 — "제출 전 확인" 이 보여준다 (문서 순서) */
+  extractable: string[]
+}
+
+export type ExportState = {
+  busy: boolean
+  progress: Progress | null
+  report: ExportReport | null
+  error: string | null
+  start: (order: string[], settings: Settings, fileName: string) => void
+  /** 마지막 요청 그대로 재시도. 실패 배너의 [다시 시도] 가 쓴다. */
+  retry: () => void
+  /** 결과 카드를 닫는다. 다음 내보내기까지 계속 떠 있을 이유가 없다. */
+  dismiss: () => void
+  cancel: () => void
+}
+
+/**
+ * 진짜 폰트로 임베드한 텍스트를 문서 순서로 모은다.
+ *
+ * 채용 시스템(ATS)이 읽어 갈 내용이 바로 이것이다. 아웃라인으로 남은 텍스트는
+ * 여기 없다 — 파서가 못 읽거나 글자를 흘리는 쪽이라, 없는 셈 치고 보여 주는 편이
+ * 정직하다. 실측한 경쟁 제품은 아웃라인 텍스트에서 "Amazon" 이 "Ama on" 으로
+ * 추출됐다.
+ */
+function extractableText(
+  parts: readonly PdfPart[],
+  accessibleReadingOrder: boolean,
+  workdayCompatibility: boolean
+): string[] {
+  return [...parts]
+    .sort((a, b) => a.index - b.index)
+    .flatMap((part) => {
+      const sources = workdayCompatibility
+        ? workdayTextOrder(part.text)
+        : accessibleReadingOrder
+          ? geometricTextOrder(part.text)
+          : part.text
+      return sources.map((run) => run.characters)
+    })
+    .filter((line) => line.trim().length > 0)
+}
+
+/** 이 부분들이 PDF 안에서 차지하는 이미지 바이트 — 손대지 않고 통과시킨 것까지 센다 */
+/** 노드별 대체 기록을 폰트별로 — 같은 글자는 한 번만 */
+function groupSubstitutions(
+  items: readonly { family: string; chars: string[] }[]
+): Array<{ family: string; chars: string[] }> {
+  const byFamily = new Map<string, Set<string>>()
+  for (const item of items) {
+    const chars = byFamily.get(item.family) ?? new Set<string>()
+    for (const char of item.chars) chars.add(char)
+    byFamily.set(item.family, chars)
+  }
+  return [...byFamily.entries()].map(([family, chars]) => ({ family, chars: [...chars].sort() }))
+}
+
+function imageBytesOf(parts: readonly PdfPart[]): number {
+  return parts.reduce((sum, part) => sum + part.stats.bytesAfter + part.stats.bytesUntouched, 0)
+}
+
+/** ui-preview 캡처 자동화용 — Figma 안에서는 전역이 없어 항상 null */
+function previewReport(): ExportReport | null {
+  return (window as { __PREVIEW_REPORT__?: ExportReport }).__PREVIEW_REPORT__ ?? null
+}
+
+export function useExport(
+  storedFonts: StoredFont[],
+  embedText: boolean,
+  keepLinks: boolean,
+  glyphFallback: boolean,
+  accessibleReadingOrder: boolean,
+  workdayCompatibility: boolean
+): ExportState {
+  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState<Progress | null>(null)
+  const [report, setReport] = useState<ExportReport | null>(previewReport)
+  const [error, setError] = useState<string | null>(null)
+
+  const parts = useRef<PdfPart[]>([])
+  // 목표 용량 탐색 1회차 결과. 2회차가 없으면(이미 목표 이하) 이걸 그대로 저장한다.
+  const measured = useRef<{ parts: PdfPart[]; merged: MergeOutput | null } | null>(null)
+  /** 직접 교체는 매 시도마다 이 기준 부분들에서 시작한다 — 직전 후보를 또 교체하지 않는다. */
+  const directBase = useRef<{ parts: PdfPart[]; merged: MergeOutput } | null>(null)
+  /** 목표 안에 든 병합본 — 더 선명한 후보와 재시도가 전부 넘치면 이걸 저장한다 (fitToSize.decideFit) */
+  const best = useRef<{ parts: PdfPart[]; merged: MergeOutput } | null>(null)
+  const startedAt = useRef(0)
+  // 실행 번호. 늦게 끝난 옛 실행의 머지·측정이 새 실행에 섞이지 않게 완료 시점에 대조한다
+  const run = useRef(0)
+  // 지금 받는 중인 실행이 있는가 — 취소한 뒤 늦게 오는 진행·조각·오류는 버린다
+  const active = useRef(false)
+  const fonts = useRef<StoredFont[]>(storedFonts)
+  const wantsText = useRef(embedText)
+  const wantsLinks = useRef(keepLinks)
+  const wantsFallback = useRef(glyphFallback)
+  const wantsAccessibleReadingOrder = useRef(accessibleReadingOrder)
+  const wantsWorkdayCompatibility = useRef(workdayCompatibility)
+  fonts.current = storedFonts
+  wantsText.current = embedText
+  wantsLinks.current = keepLinks
+  wantsFallback.current = glyphFallback
+  wantsAccessibleReadingOrder.current = accessibleReadingOrder
+  wantsWorkdayCompatibility.current = workdayCompatibility
+
+  useEffect(() => {
+    const offProgress = on<ProgressHandler>('progress', (progress) => {
+      if (active.current) setProgress(progress)
+    })
+
+    const offPart = on<PdfPartHandler>('pdf:part', (part) => {
+      if (active.current) parts.current.push(part)
+    })
+
+    const offDone = on<DoneHandler>('done', (done) => {
+      void finish(done)
+    })
+
+    const offError = on<ErrorHandler>('error', (payload) => {
+      if (!active.current) return
+      active.current = false
+      // 실패로 끝난 실행의 조각을 남기면 다음 실행에 섞여 들어간다
+      parts.current = []
+      measured.current = null
+      directBase.current = null
+      best.current = null
+      forgetOriginals()
+      setError(payload.message)
+      setBusy(false)
+      setProgress(null)
+    })
+
+    /** 부분들을 한 PDF 로 합친다. 폰트 캐시는 문서 전체에 하나여야 한다. */
+    async function mergeCollected(collected: PdfPart[], fileName: string): Promise<MergeOutput> {
+      // 페이지마다 캐시를 만들면 같은 폰트가 페이지 수만큼 중복 임베드된다 (5쪽이면 4종 → 20벌)
+      let cache: FontCache | null = null
+
+      return await mergePdfs(collected, {
+        title: fileName.replace(/\.pdf$/i, ''),
+        createdAt: new Date(),
+        ownImageSizes: ownImageSizes(),
+        drawText: wantsText.current
+          ? async (document, page, index) => {
+              const part = collected.find((candidate) => candidate.index === index)
+              if (part === undefined || part.text.length === 0)
+                return { drawn: 0, fallbacks: [], substitutions: [] }
+              cache ??= new FontCache(document, fonts.current, (font) => loadFontBytes(font))
+              return await drawTextLayer(page, part.text, cache, undefined, {
+                links: wantsLinks.current,
+                glyphFallback: wantsFallback.current,
+                accessibleReadingOrder: wantsAccessibleReadingOrder.current,
+                workdayCompatibility: wantsWorkdayCompatibility.current
+              })
+            }
+          : undefined
+      })
+    }
+
+    /**
+     * 목표 용량 탐색 1회차: 저장하지 않고 실제 크기만 재서 메인에 돌려준다.
+     * 머지가 실패하면 크기 0 으로 알린다 — 메인이 탐색을 접고 기준 결과로 마무리한다.
+     */
+    async function measure(done: DoneReport, collected: PdfPart[]): Promise<void> {
+      const mine = run.current
+      try {
+        const merged = await mergeCollected(collected, done.fileName)
+        if (mine !== run.current) return // 늦게 끝난 옛 실행 — 새 실행의 측정을 덮어쓰지 않는다
+        const imagesValid = processedImagesArePresent(collected, merged.images.count)
+        // 깨진 측정본으로 마지막 정상 슬롯을 덮지 않는다. 메인이 같은 프로필을 한 번 더 내보낸 뒤에도
+        // 실패하면 저장 자체를 중단한다.
+        if (imagesValid) {
+          measured.current = { parts: collected, merged }
+          directBase.current ??= { parts: collected, merged }
+          if (done.keepUnder !== undefined && merged.bytes.length <= done.keepUnder) {
+            best.current = { parts: collected, merged }
+          }
+        } else {
+          console.warn(
+            '[fit] rejected PDF measurement: processed images are absent; retrying the Figma export'
+          )
+        }
+        emit<FitMeasuredHandler>('fit:measured', {
+          reqId: done.reqId ?? '',
+          pdfBytes: merged.bytes.length,
+          imageBytes: imageBytesOf(collected),
+          pdfImageBytes: merged.images.bytes,
+          pdfOwnImageBytes: merged.images.own,
+          imagesValid
+        })
+      } catch {
+        if (mine !== run.current) return
+        measured.current = { parts: collected, merged: null }
+        emit<FitMeasuredHandler>('fit:measured', {
+          reqId: done.reqId ?? '',
+          pdfBytes: 0,
+          imageBytes: 0,
+          pdfImageBytes: 0,
+          pdfOwnImageBytes: 0,
+          imagesValid: true
+        })
+      }
+    }
+
+    const offDirect = on<FitDirectHandler>('fit:direct', (payload) => {
+      const mine = run.current
+      void (async (): Promise<void> => {
+        const base = directBase.current
+        if (base === null) {
+          emit<FitDirectResultHandler>('fit:direct:result', {
+            reqId: payload.reqId,
+            ok: false,
+            reason: 'direct: baseline PDF is unavailable'
+          })
+          return
+        }
+
+        try {
+          const patched = await patchFitParts(
+            base.parts,
+            payload.pages,
+            payload.baselineProfile,
+            payload.profile
+          )
+          const merged = await mergeCollected(patched.parts, payload.fileName)
+          if (mine !== run.current || !active.current) {
+            emit<FitDirectResultHandler>('fit:direct:result', {
+              reqId: payload.reqId,
+              ok: false,
+              reason: 'direct: export cancelled'
+            })
+            return
+          }
+          measured.current = { parts: patched.parts, merged }
+          if (merged.bytes.length <= payload.targetBytes) {
+            best.current = { parts: patched.parts, merged }
+          }
+          console.log(
+            '[fit] direct PDF attempt',
+            merged.bytes.length,
+            `bytes; replaced ${patched.matched}, kept baseline ${patched.skipped}; skipped second Figma export`
+          )
+          emit<FitDirectResultHandler>('fit:direct:result', {
+            reqId: payload.reqId,
+            ok: true,
+            pdfBytes: merged.bytes.length,
+            pdfImageBytes: merged.images.bytes,
+            pdfOwnImageBytes: merged.images.own,
+            complete: patched.complete
+          })
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          if (mine === run.current && active.current) {
+            console.warn('[fit] direct PDF fallback:', reason)
+          }
+          emit<FitDirectResultHandler>('fit:direct:result', {
+            reqId: payload.reqId,
+            ok: false,
+            reason
+          })
+        }
+      })()
+    })
+
+    async function finish(done: DoneReport): Promise<void> {
+      const mine = run.current
+      const arrived = parts.current
+      parts.current = []
+
+      // 취소는 저장하지 않는다 — 조각을 버리고 다음 실행을 바로 받을 수 있게 비운다 (PRD §7.4).
+      // 취소 버튼이 이미 화면을 정리했으므로 여기서는 남은 것만 버린다
+      if (done.cancelled || !active.current) {
+        measured.current = null
+        directBase.current = null
+        best.current = null
+        forgetOriginals()
+        return
+      }
+
+      if (done.measureOnly === true) {
+        await measure(done, arrived)
+        return
+      }
+
+      const stash = measured.current
+      const kept = best.current
+      const baseline = directBase.current
+      measured.current = null
+      directBase.current = null
+      best.current = null
+      forgetOriginals()
+
+      // 새 조각이 없으면 메인이 고른 슬롯을 쓴다 — 목표 안 보관본이거나 마지막 측정본.
+      // 측정한 병합본을 그대로 저장하므로 잰 바이트와 저장 바이트가 같다
+      const source = savedSource(
+        arrived.length > 0,
+        kept !== null,
+        done.saveBest === true,
+        done.saveBaseline === true,
+        baseline !== null
+      )
+      const collected =
+        source === 'arrived'
+          ? arrived
+          : source === 'best'
+            ? (kept?.parts ?? [])
+            : source === 'baseline'
+              ? (baseline?.parts ?? [])
+              : (stash?.parts ?? [])
+      const premerged =
+        source === 'arrived'
+          ? null
+          : source === 'best'
+            ? (kept?.merged ?? null)
+            : source === 'baseline'
+              ? (baseline?.merged ?? null)
+              : (stash?.merged ?? null)
+
+      try {
+        if (collected.length === 0) {
+          setError(t('export.nothing'))
+          setReport({
+            fileName: done.fileName,
+            byteLength: 0,
+            pageCount: 0,
+            elapsedMs: Date.now() - startedAt.current,
+            skipped: done.skipped,
+            imagesProcessed: 0,
+            imagesCropped: 0,
+            imagesRecovered: 0,
+            textDrawn: 0,
+            fallbacks: [],
+            imageWarnings: [],
+            textEmbedded: wantsText.current,
+            substitutions: [],
+            fit: done.fit ?? null,
+            outlines: { fonts: 0, vectorBytes: 0 },
+            images: { count: 0, bytes: 0, own: 0 },
+            extractable: []
+          })
+          return
+        }
+
+        const merged = premerged ?? (await mergeCollected(collected, done.fileName))
+        if (mine !== run.current) return // 늦게 끝난 옛 실행 — 새 실행 위에 저장하지 않는다
+
+        // 검증을 통과해 글리프를 지운 노드를 그리지 못했다면 글자가 빠진 문서다 — 성공으로 저장하지
+        // 않는다. 원본은 그대로이니 다시 시도하면 된다 (PRD G4 는 원본, 이건 출력물의 내용 보존)
+        if (merged.textFallbacks.length > 0) {
+          setError(
+            t('export.textLost', {
+              count: merged.textFallbacks.length,
+              reason: formatReason(merged.textFallbacks[0].reason)
+            })
+          )
+          return
+        }
+
+        const bytes = merged.bytes
+        downloadPdf(bytes, done.fileName)
+        // 플러그인 창을 안 보고 있어도 완료를 알 수 있게 캔버스 토스트로도 알린다
+        emit<ToastHandler>(
+          'toast',
+          t('report.saved', { file: done.fileName, size: formatBytes(bytes.length) })
+        )
+
+        // 여러 쪽에 깔린 같은 사진은 한 장 — 해시를 합쳐 센다(결과 카드의 "N장 중 M장")
+        const union = (pick: (part: PdfPart) => readonly string[]): number =>
+          new Set(collected.flatMap((part) => pick(part))).size
+        const stats = {
+          imagesProcessed: union((part) => part.stats.imagesProcessed),
+          imagesCropped: union((part) => part.stats.imagesCropped),
+          imagesRecovered: union((part) => part.stats.imagesRecovered),
+          fallbacks: collected.flatMap((part) => part.stats.fallbacks),
+          imageWarnings: collected.flatMap((part) => part.stats.imageWarnings)
+        }
+        // 장수는 서로 다른 원본으로 센다 — PDF 안의 이미지 객체 수(쪽마다 한 벌씩)로 세면
+        // 체크리스트의 "54장" 이 결과에서 "66장" 이 돼 뭘 놓쳤나 싶어진다. 바이트는 파일 그대로.
+        const distinctImages = new Set(collected.flatMap((part) => part.stats.imageHashes))
+
+        setReport({
+          fileName: done.fileName,
+          byteLength: bytes.length,
+          pageCount: merged.pageCount,
+          elapsedMs: Date.now() - startedAt.current,
+          skipped: done.skipped,
+          imagesProcessed: stats.imagesProcessed,
+          imagesCropped: stats.imagesCropped,
+          imagesRecovered: stats.imagesRecovered,
+          textDrawn: merged.textDrawn,
+          substitutions: groupSubstitutions(merged.textSubstitutions),
+          fallbacks: [...stats.fallbacks, ...merged.textFallbacks],
+          imageWarnings: stats.imageWarnings,
+          textEmbedded: wantsText.current,
+          fit: logFit(done.fit ?? null, bytes.length),
+          outlines: merged.outlines,
+          images: {
+            count: distinctImages.size,
+            bytes: merged.images.bytes,
+            own: merged.images.own
+          },
+          extractable: extractableText(
+            collected,
+            wantsAccessibleReadingOrder.current,
+            wantsWorkdayCompatibility.current
+          )
+        })
+        setError(null)
+      } catch (mergeError) {
+        if (mine !== run.current) return
+        setError(mergeError instanceof Error ? mergeError.message : String(mergeError))
+      } finally {
+        // 옛 실행의 뒷정리가 새 실행의 busy 를 풀면 안 된다
+        if (mine === run.current) {
+          active.current = false
+          setBusy(false)
+          setProgress(null)
+        }
+      }
+    }
+
+    return () => {
+      offProgress()
+      offPart()
+      offDone()
+      offError()
+      offDirect()
+    }
+  }, [])
+
+  const lastRequest = useRef<{ order: string[]; settings: Settings; fileName: string } | null>(null)
+
+  const start = useCallback((order: string[], settings: Settings, fileName: string) => {
+    lastRequest.current = { order, settings, fileName }
+    run.current += 1
+    active.current = true
+    parts.current = []
+    measured.current = null
+    directBase.current = null
+    best.current = null
+    // 앞 실행이 취소된 뒤 늦게 도착한 원본이 남아 있을 수 있다 — 새 실행은 빈 캐시에서 시작한다
+    forgetOriginals()
+    startedAt.current = Date.now()
+    setBusy(true)
+    setError(null)
+    setReport(null)
+    setProgress({ label: t('progress.prepare'), current: 0, total: Math.max(order.length, 1) })
+    emit<ExportHandler>('export', { order, settings, fileName })
+  }, [])
+
+  const retry = useCallback(() => {
+    const request = lastRequest.current
+    if (request !== null) start(request.order, request.settings, request.fileName)
+  }, [start])
+
+  /**
+   * 즉시 취소 — 메인의 정리를 기다리지 않고 화면을 비운다. 부분 결과는 저장하지 않는다.
+   * 늦게 오는 진행·조각·완료·오류는 실행 번호가 달라 버려지고, 바로 다시 내보낼 수 있다.
+   */
+  const cancel = useCallback(() => {
+    if (!active.current) return
+    run.current += 1
+    active.current = false
+    parts.current = []
+    measured.current = null
+    directBase.current = null
+    best.current = null
+    forgetOriginals()
+    emit<CancelHandler>('cancel')
+    setBusy(false)
+    setProgress(null)
+    setError(null)
+    setReport(null)
+    emit<ToastHandler>('toast', t('export.cancelled'))
+  }, [])
+
+  const dismiss = useCallback(() => {
+    setReport(null)
+    setError(null)
+  }, [])
+
+  return { busy, progress, report, error, start, retry, cancel, dismiss }
+}
+
+/**
+ * 목표 용량의 예측 대 실제를 콘솔에 남긴다 — 반올림 전 바이트와 오차율, 후보별 예측까지.
+ * "예측 4.7MB·실제 4.7MB" 로는 정확한지 알 수 없다(검토). 결과는 그대로 돌려준다
+ */
+function logFit(fit: FitReport | null, actualBytes: number): FitReport | null {
+  if (fit === null) return fit
+  const error =
+    fit.predictedBytes > 0 ? ((actualBytes - fit.predictedBytes) / fit.predictedBytes) * 100 : 0
+  console.log(
+    '[fit] final predicted',
+    fit.predictedBytes,
+    'actual',
+    actualBytes,
+    `error ${error.toFixed(2)}%`,
+    'target',
+    fit.targetBytes,
+    'chosen',
+    fit.profile,
+    'candidates',
+    (fit.probes ?? []).map(
+      (probe) =>
+        `${probe.multiplier}x${probe.maxEdge} q${Math.round(probe.quality * 100)} → ${probe.predicted}`
+    ),
+    'attempts',
+    (fit.attempts ?? []).map(
+      (attempt) =>
+        `${attempt.multiplier}x${attempt.maxEdge} q${Math.round(attempt.quality * 100)} → ${attempt.actual}`
+    ),
+    'calibration',
+    fit.calibration
+  )
+  return fit
+}

@@ -1,0 +1,382 @@
+# Heavyweight – ATS-Friendly PDF Export from Figma
+
+![Heavyweight — compressed PDF export with real fonts](docs/brand/cover-1920x960.png?v=6)
+
+A Figma plugin that exports frames as **light PDFs with real embedded fonts**.
+
+Heavyweight is a personal fork of
+[Featherweight](https://github.com/coffeequickly/featherweight), extended with
+an optional ATS/accessibility export mode and Workday-oriented reading order.
+The original project and this fork are available under the MIT License.
+
+Figma's built-in PDF export turns every letter into vector outlines. Your text
+can't be selected, searched, or read by résumé scanners (ATS) — and text-heavy
+documents balloon to 10–20MB that no compressor can shrink, because there are no
+images to compress.
+
+Heavyweight fixes the text problem itself:
+
+- **Real fonts, not outlines** — text is re-embedded as subset fonts, so it stays
+  selectable, searchable, copy-pasteable and ATS-parseable.
+- **Optional ATS/accessibility order** — searchable text can be written by page
+  position, top to bottom and left to right, without changing how the PDF looks.
+- **Smart image downscaling** — images are resized to their displayed size before
+  export; anything already within the frame's budget passes through untouched.
+  A picture that is only partly visible is stored as just that visible area when
+  doing so makes the file smaller without losing sharpness.
+- **Fit to a target size** — name a number (say 5 MB) and Heavyweight finds the
+  best image quality that still fits, or tells you the smallest it can reach.
+
+A text-heavy résumé drops from ~10MB to under 1MB.
+
+The public Figma Community listing is the upstream Featherweight plugin. This
+Heavyweight fork is installed locally from its `manifest.json` file.
+
+The plugin UI follows your Figma app language (English / Korean). 한국어 안내는 [아래](#한국어-안내)에 있습니다.
+
+**New in 2.4** — text comes out the way Figma draws it. Pair kerning is
+applied, OpenType features you set in Figma (stylistic sets, kerning and
+ligature toggles) are honoured, mixed fonts inside one layer each get their own
+font, and a glyph the font lacks (an em dash, a thin space) is drawn with a
+fallback font — Inter first, Pretendard for CJK — instead of turning the whole
+layer into outlines; the report says which characters, and you can turn it off.
+Korean line-break joiners no longer force outlines either.
+
+**New in 2.3** — hyperlinks on text stay clickable in the PDF (Advanced →
+Keep hyperlinks). **OTF fonts** can be added now, not just TTF. The font
+folder picker explains itself.
+
+**New in 3.2** — pictures that are only partly visible are stored as just the
+visible area, when that makes the file smaller without losing sharpness anywhere
+(Options → "Trim pictures to the visible area", on by default). Image size is now
+three bars — Largest · Smallest · Scale — with four of the document's own images
+drawn to their real aspect ratio above them, and the Images list shows visible
+area, original, stored size and trimmed share per row. Target size measures the
+finished PDF and re-exports with the next candidate if it came out over, predicts
+from Figma's own re-encoding (within about 3% on three real documents), and the
+result card says which settings it chose. For verified opaque JPEGs it can reuse
+the measured PDF and replace only its image streams; uncertain structures and
+transparent images stay on Figma's normal export path. A measured PDF that loses
+all processed images is rejected instead of being mistaken for a tiny success.
+
+**New in 3.1** — bulleted and numbered lists export as real text. The bullet or
+number is drawn where Figma puts it, so it stays selectable and searchable. Lists
+in right-to-left scripts keep their outlines.
+
+**New in 3.0** — six tabs that follow the work: **Start · Order · Fonts ·
+Images · Options · Result**. Start shows only what needs you and the tab holding
+it turns amber. Fonts groups by family with a detail page per style and a
+storage screen you can empty. Images gains **3× and 4×** for print (216 and
+288 DPI) and lists every image with the size it starts at and the size it ends
+up. **Result** opens on the finished PDF — its first page, what went in with
+fonts, what stayed outlined and why, and the text a parser will actually read.
+Dark interface.
+
+**New in 2.2** — **Target** now spends the whole budget. If Balanced already
+fits, it climbs toward Sharp; between ladder steps it fine-tunes JPEG quality;
+and predictions are calibrated against what Figma actually puts in the PDF, so
+a 9.5 MB target lands at 8.0 MB instead of 3.5 MB.
+
+**New in 2.1** — works in **Figma Slides**: run it in a deck and every slide
+is a page, in deck order, with real fonts and downscaled images (Slides' own
+PDF export outlines the text and keeps every image at full size). Selecting a
+section exports the frames inside it. Selecting thirty frames no longer
+freezes the canvas, and image-heavy exports are faster.
+
+**New in 2.0** — one screen instead of tabs (3.0 brought tabs back, arranged by
+the order of the work rather than by feature). Presets became tiles that show
+the numbers they set, a _Before you export_ checklist said what would change,
+and missing fonts could be picked out of a font folder in one go.
+
+## How it works
+
+1. Select frames on the canvas and run Heavyweight — in Figma Slides, run it
+   with nothing selected to export the whole deck
+2. Pick a preset at the top — Sharp / Balanced / Smallest, or **Target** to name
+   a file size. The chips underneath show exactly what changes
+3. Check the **Start** tab. It lists only what needs you — a missing font, text
+   that would stay outlined and why — and the tab that fixes it turns amber.
+   Follow it, or export anyway; your layers are never modified
+4. **Export PDF** — the save dialog is pre-filled with a timestamped file name.
+   **Result** then shows the first page, what was embedded, what stayed as
+   outlines and why (click a reason to select those layers on canvas), and the
+   text a parser will read
+
+## Fonts
+
+60 families are downloaded and embedded automatically — 43 Latin (Inter, Roboto,
+Open Sans, Montserrat, Lato, Poppins, IBM Plex, JetBrains Mono…) and 17 Korean
+(Pretendard, Noto Sans KR, Nanum, Gothic A1, Spoqa…), italics included.
+
+The Fonts screen lists every font your document uses, in one of three states:
+
+| State        | What happens                                                                                                                                                                                                                                                               |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| In catalog   | Downloaded from a CDN (jsDelivr) at export time and embedded. Nothing to do                                                                                                                                                                                                |
+| Added by you | Add a static TTF or OTF once — or pick your font folder and the matching files are found for you (`.ttc` collections — the format macOS and Windows ship system fonts in, from Helvetica Neue to Gulim — work; the right face is picked). Stored and embedded from then on |
+| No file      | **Kept as outlines** — identical look, you just don't get the size and search benefits                                                                                                                                                                                     |
+
+**Fonts are never substituted.** If a font can't be embedded, the original
+outlines stay exactly as Figma drew them.
+
+Figma doesn't hand plugins the fonts installed on your computer, which is why
+anything outside the catalog needs its file once. Variable font files (one file
+holding every weight, the default download from Google Fonts) are skipped —
+use the files in the download's `static` folder. Google names the static files
+of optical-size families "Inter 18pt" or "Merriweather 24pt": the scan maps
+them to the family Figma shows and picks the size closest to your text. Width
+variants such as "Open Sans Condensed" are matched by name, never swapped for
+the normal width. After a scan each font says what was found and why it
+wasn't added; if the plugin's 5 MB of storage is full, the screen shows the
+space needed and a Retry that saves the file once you free some. A font whose
+own embedding flag forbids document embedding (the OS/2 "Restricted License"
+bit — the rule Acrobat and browsers follow) is refused and stays as outlines;
+Preview & Print, Editable and Installable fonts are embedded as subsets, and a
+font that forbids subsetting is embedded whole. The flag is the font's word, not
+a license review: when you add system or commercial fonts, make sure their
+license allows embedding in documents you share; most do for PDFs.
+
+Auto-downloaded families (all SIL OFL 1.1):
+
+> Pretendard · Pretendard JP · Nanum Gothic · Nanum Myeongjo · Nanum Gothic
+> Coding · Nanum Pen/Brush Script · Gothic A1 · Gowun Dodum · Gowun Batang ·
+> IBM Plex Sans KR · Spoqa Han Sans Neo · Do Hyeon · Jua · Black Han Sans
+
+Inter is fetched as the same build Figma bundles (3.19, from the Inter
+repository), so widths and stem weights match Figma's rendering; the Inter 4.0
+that Google Fonts ships has a narrower "1" and slightly heavier strokes.
+
+Every URL in the catalog is verified against the real files by
+`npm run verify:catalog` (is it a static font with outlines, does it cover
+Hangul, does the weight match).
+
+## What stays as outlines
+
+These are kept as original outlines by design — the report tells you which nodes
+and why, and clicking a reason selects them on canvas:
+
+- Rotated or flipped text, text on a path
+- Text with gradient/image fills, strokes, or effects (shadow, blur)
+- Underlined or struck-through text (redrawing those isn't implemented yet —
+  better an outline than a silently dropped underline)
+- Text used as a mask or inside a masked group, text with a blend mode, text
+  inside a translucent layer, under a layer blur or an unfilled shadow, or
+  running outside a clipping frame — redrawn text can't take part in that
+  compositing, so the original outlines stay
+- Superscript and subscript text — Figma synthesizes superscripts for glyphs the
+  font lacks (and, once mixed, for the whole layer); redrawing with the font's
+  own `sups`/`subs` glyphs looked different and left commas at body size
+- Lists in right-to-left scripts — the marker position can't be measured, so
+  they keep their outlines (bulleted and numbered lists otherwise export as
+  real text, since 3.1)
+- Text whose font file can't be obtained, or containing glyphs the font lacks
+
+## Good to know
+
+- **Always proofread the exported PDF before submitting it anywhere.** Text is
+  redrawn with real fonts and may differ subtly from Figma's rendering. You are
+  responsible for the files you produce with this plugin.
+- Embedded text can look a touch heavier than Figma's outlines in some viewers
+  (macOS Preview renders real fonts with its own smoothing). The glyph shapes are
+  identical; it is the viewer, not the file.
+- A font with the same name can come in different builds (Inter 3.19 as bundled
+  by Figma vs Inter 4.0 from Google Fonts: a narrower "1", slightly heavier
+  strokes). The Fonts screen shows which build is embedded, and before drawing,
+  the export compares the width of a line as Figma rendered it with the same
+  line set in the embedded font — if they differ, that font's text stays as
+  outlines and the report says why.
+- **Fonts you add yourself are embedded as-is.** Confirming that your font's
+  license permits document embedding is your responsibility — many commercial
+  fonts restrict it. All auto-downloaded fonts are SIL OFL and permit embedding.
+- **Network access is used only to download open-license fonts**
+  (`cdn.jsdelivr.net`). Your document's content never leaves your machine, and
+  there is no telemetry.
+- Text is embedded in an extractable form, but no specific ATS parsing result is
+  guaranteed.
+
+## 한국어 안내
+
+Figma 기본 PDF 내보내기는 글자를 전부 벡터 아웃라인으로 바꿉니다. 텍스트를 선택할
+수도, 검색할 수도, 채용 시스템(ATS)이 읽을 수도 없습니다. 게다가 글 위주 문서가
+10~20MB로 불어나는데, 이미지가 없으니 어떤 압축 도구로도 줄지 않습니다.
+
+Heavyweight는 텍스트 자체를 고치고, 파일을 필요한 크기로 맞추고, 내보내기 전에
+무슨 일이 일어날지 먼저 알려 줍니다. 플러그인 화면은 Figma 앱 언어 설정에 따라
+한국어로 나옵니다.
+
+**[Figma Community에서 설치 →](https://www.figma.com/community/plugin/1672509720278498323/featherweight-compressed-pdf-export-with-real-fonts)**
+
+### 하는 일
+
+- **아웃라인 대신 진짜 폰트** — 텍스트를 서브셋 폰트로 다시 넣습니다. 이탤릭까지요.
+  선택·검색·복사가 되고 ATS가 읽습니다. Inter(Figma 기본 서체), Roboto, Pretendard
+  등 60종은 자동으로 받아 넣습니다. 글 위주 이력서가 10MB에서 1MB 아래로 내려갑니다.
+- **ATS·스크린리더 읽기 순서(선택)** — 페이지의 모양은 그대로 두고, 검색 가능한
+  텍스트만 위에서 아래로, 같은 줄은 왼쪽에서 오른쪽 순서로 저장할 수 있습니다.
+- **보이는 크기에 맞춘 이미지 압축** — 이미지는 실제로 표시되는 크기에 맞춰 줄이고
+  다시 인코딩합니다. 고화질 / 균형 / 최소 용량 / 목표 용량 중 하나를 고르면 끝이고,
+  이미지 탭 맨 위에서 언제든 바꿀 수 있습니다. 숫자를 직접 정하고 싶으면 고급 옵션을
+  펼쳐 **최대**(한 장이 넘을 수 없는 px) · **최소**(아무리 작게 놓여도 이 밑으로는 안
+  줄임) · **배율**(놓인 크기의 몇 배로 담을까)을 각각 잡습니다. 셋 다 제 값이 그대로
+  보여서 어떤 값도 다른 값을 조용히 덮어쓰지 않습니다.
+
+  그 위에는 이 문서의 실제 이미지 넷을 진짜 가로세로 비로 그립니다 — 점선이 지금
+  크기, 칠한 사각형이 내보낼 크기, 사선은 손대지 않는 것입니다. 바를 움직이면 사각형이
+  따라 움직이므로 설정이 어디에 닿는지 내보내기 전에 눈으로 확인됩니다. 아래 목록은
+  같은 것을 숫자로 한 줄씩 말하고, 줄을 누르면 캔버스에서 그 레이어를 보여 줍니다.
+  로고와 작은 이미지는 손대지 않으니 선명하던 것이 뭉개지지 않습니다.
+
+  잘라 쓰거나 비율이 어긋나게 채운 이미지는 보이는 부분이 제 밀도를 가지려면 원본이
+  더 커야 합니다. 그것까지 셈해서 필요한 만큼만 남깁니다.
+
+  일부만 보이는 이미지는 모든 자리의 선명도를 지키면서 파일이 실제로 작아질 때만
+  보이는 영역만 저장합니다(옵션 탭 "보이는 영역만 저장", 기본 켬). 이미지 탭 목록은
+  줄마다 보이는 영역 · 원본 · 저장 크기 · 잘린 영역을 보여 줍니다.
+
+- **목표 용량 맞추기** — 업로드 한도가 5MB라면 숫자만 적으세요. 한 번 내보내 크기를
+  재고, 그 안에 드는 가장 좋은 화질을 찾아 다시 내보냅니다. 완성된 PDF의 실제 크기를
+  다시 재서 목표를 넘으면 다음 후보로 최대 두 번 더 내보내고, 결과 탭에 자동으로 고른
+  설정을 적습니다. 화질에는 하한이 있어서 목표가 무리면 가능한 가장 작은 파일과 함께
+  그 하한을 알려 드립니다.
+- **내보내기 전에 미리 확인** — 시작·정렬·폰트·이미지·옵션·결과 여섯 탭이 작업
+  순서대로 놓여 있습니다. 시작 탭은 손볼 것만 보여 주고, 그것이 든 탭은 색으로
+  알려 줍니다 — 없는 폰트, 왜 아웃라인으로 남는 텍스트인지, 그 레이어로 가는 링크까지.
+- **내보낸 뒤에 무엇이 들어갔는지** — 결과 탭이 완성된 PDF의 첫 장, 파일 크기,
+  폰트와 함께 들어간 텍스트와 아웃라인으로 남은 텍스트를 사유별로 보여 줍니다.
+  사유를 누르면 그 레이어가 캔버스에서 선택됩니다. 파서가 실제로 읽을 텍스트도
+  그 자리에서 확인할 수 있어, 제출 전에 이름과 연락처가 빠지지 않았는지 봅니다.
+
+이 다섯이 합쳐지면 차이가 큽니다. 12쪽 포트폴리오가 같은 페이지, 같은 모습으로
+22.7MB에서 4.0MB가 됐습니다.
+
+### 사용법
+
+1. 프레임을 선택하고 Heavyweight를 실행합니다. Figma Slides에서는 아무것도
+   고르지 않으면 덱 전체가 대상입니다
+2. 프리셋을 고릅니다. 목표 용량이면 원하는 크기를 적습니다
+3. 시작 탭을 봅니다. 경고가 있으면 따라가서 페이지를 정렬하거나, 폰트를
+   넣거나, 레이어를 찾습니다
+4. 내보내기 — 저장 창에 날짜가 붙은 파일명이 미리 채워져 있습니다
+
+### 다른 점
+
+- 오픈 라이선스 폰트 60종이 자동으로 들어갑니다. Figma 기본 서체 Inter부터 Roboto,
+  Open Sans, Montserrat, Lato, Poppins 등 라틴 43종, Pretendard, Noto Sans KR,
+  나눔, Gothic A1, Spoqa 등 한글 17종. 모든 굵기, 정체와 이탤릭 전부. 그 밖의
+  폰트는 폰트 폴더를 한 번 고르면 맞는 TTF·OTF를 찾아 넣습니다.
+- 폰트를 절대 바꿔치기하지 않습니다. 넣지 못한 텍스트는 원래 아웃라인 그대로
+  남깁니다. 보기엔 똑같고, 사유를 클릭하면 캔버스에서 그 레이어를 찾아 줍니다.
+- 전부 내 컴퓨터 안에서 처리됩니다. 문서는 어디로도 나가지 않고, 네트워크는 오픈
+  라이선스 폰트를 받는 데(cdn.jsdelivr.net)만 씁니다. 텔레메트리도, 계정도,
+  업로드도 없습니다.
+- 무료, 오픈소스(MIT).
+
+### 알아 두실 것
+
+- 내보낸 PDF는 제출 전에 꼭 확인하세요. 텍스트를 진짜 폰트로 다시 그리기 때문에
+  Figma 렌더링과 미세하게 다를 수 있습니다. 만든 파일의 책임은 사용자에게 있습니다.
+- 직접 넣은 폰트는 그대로 임베드됩니다. 정적 TTF·OTF, 굵기마다 한 파일씩(가변
+  폰트 불가). 그 폰트의 라이선스가 문서 임베딩을 허용하는지는 직접 확인하셔야
+  합니다. 자동으로 받는 폰트는 전부 SIL OFL이라 임베딩이 허용됩니다.
+- 회전된 텍스트, 그라데이션·선·효과가 있는 텍스트, 밑줄 텍스트는 원래 아웃라인을
+  유지합니다(의도한 동작이고, 조용히 바꾸지 않습니다). 시작 탭이 내보내기 전에
+  어느 것인지 알려 줍니다.
+- 텍스트는 추출 가능한 형태로 들어가지만 특정 ATS의 파싱 결과를 보장하지는
+  않습니다. Figma, Inc.와 무관합니다.
+- 폰트 출처와 라이선스는 아래 [Credits](#credits)에 있습니다.
+
+## Development
+
+Node 22.12 or newer (`.nvmrc` says 22; the build tooling and jsdom need it).
+
+```
+npm ci
+npm run dev             # watch build
+npm test                # unit tests
+npm run lint            # eslint + prettier
+npm run verify:catalog  # font catalog + pipeline check against the real CDN (network)
+npm run build           # production build
+npm run install:local   # install into ~/figma-plugins/ for manual QA
+npm run package         # dist/*.zip
+npm run ui:preview      # render the UI in a browser without Figma
+```
+
+To run a development build in Figma: `npm run build`, then in the Figma desktop
+app choose Plugins → Development → **Import plugin from manifest…** and pick the
+`manifest.json` in this repo (it is generated by the build from the
+`figma-plugin` field in `package.json`). After that, re-running `npm run build`
+is enough — no re-import needed.
+
+`npm run install:local` copies the build into `~/figma-plugins/featherweight/`
+instead, for when you would rather not point Figma at the working tree.
+
+`ui:preview` accepts query flags for reviewing states without Figma:
+`?screen=fonts&lang=en-US&platform=win&frames=12&fit=1&text=clean&bare=1`.
+`screen` is a tab id — `start` / `order` / `fonts` / `images` / `options` /
+`result` — and `sub` opens a subpage (`outline` / `extracted` / `storage`), with
+`family=` for a font's detail page. `report=1` fills the Result tab as it looks
+after an export. The interface is dark-only since 3.0, so `theme=` does nothing.
+
+Two flags exist for states that only differ by data: `images=none` drops every
+image from the selection, `images=unsized` keeps them but withholds the pixel
+sizes that arrive asynchronously. `measure=.a,.b` prints the boxes of matching
+elements into the page `<title>` — read it with `--dump-dom`. It reports the
+laid-out box **and** where the glyphs actually sit, which are not the same
+thing: the library's `Text` shrinks its own box by 9px and shifts its content
+down by 4px, so padding that is symmetric in CSS can read lopsided on screen.
+
+### Repo layout
+
+```
+src/main/**   Figma sandbox — no DOM, Canvas, or fetch
+src/ui/**     plugin iframe — Canvas, fetch, PDF assembly
+src/lib/**    pure logic, no Figma or DOM. Fully unit-tested
+tools/**      build, packaging, local install, UI preview, Figma publish
+```
+
+The split mirrors the plugin runtime's hard constraints. `docs/PRD.md` explains
+the reasoning, `docs/SPIKES.md` records the runtime assumptions verified against
+the real API, `docs/FIT-TO-SIZE.md` covers how the target-size search works,
+`docs/EXPORT-PERFORMANCE.md` documents the guarded direct-PDF fast path and its benchmark,
+`docs/CHECKLIST.md` is the manual QA pass, and `docs/RELEASE.md` is the release
+playbook.
+
+`tools/pdf-direct-probe/` is intentionally kept as an open-source, isolated experiment with its
+own README and tests. It is not built by `npm run build` and is not included in release ZIPs.
+
+## Releasing
+
+Pushing to `main` runs tests and refreshes the rolling `latest` prerelease.
+A `v*` tag builds a versioned GitHub Release with the zip attached.
+
+Publishing a new version to the Figma Community is **deliberately manual**
+(Plugins → Manage plugins → Publish new version) — see `docs/RELEASE.md` for why.
+
+## Credits
+
+### Fonts
+
+Every auto-downloaded font is licensed under the **SIL Open Font License 1.1**,
+which permits embedding in documents. Heavyweight does not modify, host or
+redistribute any font file — your machine fetches the upstream original at
+export time over the jsDelivr CDN. Every URL is pinned to a commit or a package
+version and verified weekly (`.github/workflows/catalog.yml`).
+
+| Source                                                        | Families |                                                          |
+| ------------------------------------------------------------- | -------- | -------------------------------------------------------- |
+| [Google Fonts](https://github.com/google/fonts)               | 20       | first-party                                              |
+| [Expo Google Fonts](https://github.com/expo/google-fonts)     | 36       | static builds of families Google now ships variable-only |
+| [Inter](https://github.com/rsms/inter)                        | 1        | first-party, v3.19 — the build Figma bundles             |
+| [Pretendard](https://github.com/orioncactus/pretendard)       | 2        | first-party                                              |
+| [Spoqa Han Sans Neo](https://github.com/spoqa/spoqa-han-sans) | 1        | first-party                                              |
+
+Not affiliated with, or endorsed by, any of these projects. Font names are
+trademarks of their respective owners.
+
+### Everything else
+
+- Not affiliated with Figma, Inc.
+- Built with [pdf-lib](https://github.com/Hopding/pdf-lib) (MIT) ·
+  [fontkit](https://github.com/foliojs/fontkit) (MIT) ·
+  [create-figma-plugin](https://github.com/yuanqing/create-figma-plugin) (MIT)
+- License: [MIT](LICENSE)

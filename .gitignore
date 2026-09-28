@@ -1,0 +1,24 @@
+node_modules/
+build/
+manifest.json
+.DS_Store
+*.log
+
+# 개인 자산 — 커밋 금지 (PRD §12)
+fonts/*.ttf
+fonts/*.otf
+samples/
+*.pdf
+src/**/*.css.d.ts
+.venv/
+figma-plugins/
+dist/
+
+# Old top-level files from Figma's starter template are not part of Heavyweight.
+/code.js
+/code.ts
+/ui.html
+/eslint.config.js
+
+# 미디어 렌더링용 중간 산출물 — 릴리즈마다 다시 찍는다 (docs/RELEASE.md)
+docs/brand/src/ui-*.png

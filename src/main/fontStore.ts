@@ -1,0 +1,112 @@
+// clientStorage 접근은 메인 스레드에서만 된다. UI 는 메시지로 요청한다. (PRD C3)
+
+import {
+  FONT_INDEX_KEY,
+  FONT_KEY_PREFIX,
+  fontStorageKey,
+  legacyFontStorageKey,
+  removeFont,
+  upsertFont
+} from '../lib/fontStore'
+import { createSerialQueue } from '../lib/serialQueue'
+import { FontFileFacts, FontRef, StoredFont } from '../lib/types'
+
+/**
+ * 인덱스는 읽고→고치고→쓰기라 동시에 실행되면 먼저 쓴 항목이 사라진다.
+ * 폰트를 한꺼번에 여러 개 넣을 때(자동 불러오기) 실제로 첫 번째가 없어졌다. 한 줄로 세운다.
+ */
+const queue = createSerialQueue()
+
+export async function listFonts(): Promise<StoredFont[]> {
+  const index = (await figma.clientStorage.getAsync(FONT_INDEX_KEY)) as StoredFont[] | undefined
+  if (!Array.isArray(index)) return []
+  return index
+}
+
+/**
+ * 바이트를 먼저 쓰고 인덱스를 갱신한다. 바이트 쓰기가 한도 초과로 실패하면
+ * 인덱스는 그대로라서 "인덱스에는 있는데 바이트가 없는" 상태가 생기지 않는다.
+ */
+export function saveFont(font: StoredFont, bytes: Uint8Array): Promise<StoredFont[]> {
+  return queue(async () => {
+    await figma.clientStorage.setAsync(fontStorageKey(font), bytes)
+    // 옛 키에 남은 같은 폰트의 바이트는 이제 참조되지 않는다 — 한도를 갉아먹지 않게 지운다
+    await figma.clientStorage.deleteAsync(legacyFontStorageKey(font))
+    const next = upsertFont(await listFonts(), font)
+    await figma.clientStorage.setAsync(FONT_INDEX_KEY, next)
+    return next
+  })
+}
+
+/** 옛 항목에 파일 사실을 적는다. 자리가 사라졌으면 그냥 지금 인덱스 */
+export function setFontFacts(ref: FontRef, facts: FontFileFacts): Promise<StoredFont[]> {
+  return queue(async () => {
+    const next = (await listFonts()).map((font) =>
+      font.family === ref.family && font.style === ref.style ? { ...font, facts } : font
+    )
+    await figma.clientStorage.setAsync(FONT_INDEX_KEY, next)
+    return next
+  })
+}
+
+export function deleteFont(ref: FontRef): Promise<StoredFont[]> {
+  return queue(async () => {
+    await figma.clientStorage.deleteAsync(fontStorageKey(ref))
+    await figma.clientStorage.deleteAsync(legacyFontStorageKey(ref))
+    const next = removeFont(await listFonts(), ref)
+    await figma.clientStorage.setAsync(FONT_INDEX_KEY, next)
+    return next
+  })
+}
+
+/**
+ * 저장소를 통째로 비운다.
+ *
+ * 인덱스가 가리키는 것만 지우면 부족하다 — 인덱스 쓰기가 밀려 남은 조각이 그대로 한도를
+ * 갉아먹어서, 비웠는데 자리가 안 돌아온다. 접두사로 걸리는 키를 전부 지운다.
+ */
+export function clearFonts(): Promise<StoredFont[]> {
+  return queue(async () => {
+    for (const key of await figma.clientStorage.keysAsync()) {
+      if (key.startsWith(FONT_KEY_PREFIX)) await figma.clientStorage.deleteAsync(key)
+    }
+    await figma.clientStorage.setAsync(FONT_INDEX_KEY, [])
+    return []
+  })
+}
+
+/**
+ * 인덱스가 가리키지 않는 폰트 바이트를 지운다.
+ * 인덱스 쓰기가 밀려서 항목이 빠지면 바이트만 남아 5MB 한도를 조용히 갉아먹는다.
+ * 인덱스가 진실이므로 참조 없는 키는 버린다 — 자동 불러오기가 다시 채운다.
+ */
+export function pruneOrphanFonts(): Promise<number> {
+  return queue(async () => {
+    const keys = await figma.clientStorage.keysAsync()
+    const existing = new Set(keys)
+    const referenced = new Set<string>()
+    for (const font of await listFonts()) {
+      referenced.add(fontStorageKey(font))
+      // 아직 새 키로 못 옮긴 옛 저장분은 살려 둔다 — 읽을 때 옮긴다
+      if (!existing.has(fontStorageKey(font))) referenced.add(legacyFontStorageKey(font))
+    }
+    const orphans = keys.filter((key) => key.startsWith(FONT_KEY_PREFIX) && !referenced.has(key))
+    for (const key of orphans) await figma.clientStorage.deleteAsync(key)
+    return orphans.length
+  })
+}
+
+/** Phase 2 에서 텍스트를 그릴 때 UI 로 넘길 폰트 바이트. 옛 키에 있으면 읽는 김에 새 키로 옮긴다. */
+export async function readFontBytes(ref: FontRef): Promise<Uint8Array | undefined> {
+  const bytes = (await figma.clientStorage.getAsync(fontStorageKey(ref))) as Uint8Array | undefined
+  if (bytes instanceof Uint8Array) return bytes
+
+  const legacyKey = legacyFontStorageKey(ref)
+  const legacy = (await figma.clientStorage.getAsync(legacyKey)) as Uint8Array | undefined
+  if (!(legacy instanceof Uint8Array)) return undefined
+  void queue(async () => {
+    await figma.clientStorage.setAsync(fontStorageKey(ref), legacy)
+    await figma.clientStorage.deleteAsync(legacyKey)
+  }).catch(() => undefined) // 옮기기에 실패해도 다음 읽기가 다시 시도한다
+  return legacy
+}

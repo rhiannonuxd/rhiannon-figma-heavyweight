@@ -1,0 +1,362 @@
+import { aggregateFontUsage, sampleCodePoints } from '../lib/fontInventory'
+import { Rect } from '../lib/clipRect'
+import { PixelSize } from '../lib/imageDensity'
+import { transformScale } from '../lib/imageTarget'
+import { FontUsage, FrameItem, PreflightFrame, RawFontSegment, TextReject } from '../lib/types'
+import { clipFor, imageUsagesOf } from './images'
+import { knownSize, persistEdgeCache, readSize, rememberSize } from './imageSize'
+import { isTemporary } from './temporary'
+import { screenTextNode } from './text'
+
+const EXPORTABLE_TYPES = [
+  'FRAME',
+  'COMPONENT',
+  'COMPONENT_SET',
+  'INSTANCE',
+  'SECTION',
+  'GROUP',
+  // Figma Slides 의 슬라이드 하나. 크기·자식·exportAsync 가 프레임과 같다.
+  'SLIDE'
+] as const
+
+type ExportableType = (typeof EXPORTABLE_TYPES)[number]
+
+export type ExportableNode = SceneNode & { type: ExportableType }
+
+const THUMB_LONG_EDGE = 160
+/** 한 번에 그리는 썸네일 수. 전부 동시에 던지면 큰 문서에서 렌더러가 버벅인다. */
+const THUMB_CONCURRENCY = 6
+
+export function isExportable(node: BaseNode): node is ExportableNode {
+  return (EXPORTABLE_TYPES as readonly string[]).includes(node.type)
+}
+
+/** 안에 든 것이 페이지가 되는 상자 — 섹션은 프레임을, 슬라이드 행은 슬라이드를 묶는다 */
+const CONTAINER_TYPES: readonly string[] = ['SECTION', 'SLIDE_ROW']
+
+/**
+ * 상자를 고르면 그 안의 페이지들이 고른 것이다.
+ *
+ * 섹션은 보통 "1장·2장·3장" 을 묶는 용도라, 섹션 하나를 고르고 내보내면 안의 프레임이
+ * 각각 한 쪽이 되기를 기대한다. 상자 안에 페이지가 될 만한 게 하나도 없으면(도형만 있는
+ * 섹션) 상자 자체를 한 쪽으로 낸다. 상자 속 상자는 그대로 따라 들어간다.
+ * 같은 노드가 두 번 잡히면(섹션과 그 안의 프레임을 같이 고름) 한 번만 센다.
+ */
+export function expandContainers(nodes: readonly SceneNode[]): ExportableNode[] {
+  const out: ExportableNode[] = []
+  const seen = new Set<string>()
+
+  const push = (node: SceneNode): void => {
+    if (isTemporary(node) || seen.has(node.id)) return
+    if (CONTAINER_TYPES.includes(node.type) && 'children' in node) {
+      const before = out.length
+      for (const child of node.children) push(child)
+      if (out.length > before) return // 안의 것들이 페이지가 됐다
+    }
+    if (isExportable(node)) {
+      seen.add(node.id)
+      out.push(node)
+    }
+  }
+
+  for (const node of nodes) push(node)
+  return out
+}
+
+/** 현재 선택에서 export 가능한 노드를 추린다. 상자는 안의 것으로 풀고, 임시 클론은 뺀다. */
+export function exportableSelection(): ExportableNode[] {
+  const picked = expandContainers(figma.currentPage.selection)
+  if (picked.length > 0) return picked
+
+  // Slides 에서 아무것도 안 골랐으면 덱 전체 — 발표 자료는 통째로 내보내는 게 기본이다.
+  // 문서 순서가 격자 순서(행 → 슬라이드)와 같다.
+  if (figma.editorType === 'slides') {
+    return figma.currentPage
+      .findAllWithCriteria({ types: ['SLIDE'] })
+      .filter((node) => !isTemporary(node)) as ExportableNode[]
+  }
+  return []
+}
+
+export type SelectionScan = {
+  items: FrameItem[]
+  fonts: FontUsage[]
+  /** 체크리스트 재료. 이미지 원본 크기는 비동기라 imageEdges 로 따로 채운다. */
+  frames: PreflightFrame[]
+  textRejects: TextReject[]
+}
+
+/** 트리를 안 걷고도 아는 것만 — 목록이 곧바로 떠야 한다. 이미지·텍스트 수는 뒤에 온다. */
+export function listItems(nodes: readonly ExportableNode[]): FrameItem[] {
+  return nodes.map((node) => ({
+    id: node.id,
+    name: node.name,
+    width: Math.round(node.width),
+    height: Math.round(node.height),
+    x: node.x,
+    y: node.y,
+    imageCount: 0,
+    textCount: 0,
+    layerIndex: layerIndexOf(node)
+  }))
+}
+
+/**
+ * 레이어 패널에서 위에서 몇 번째인가. children 은 아래에서 위 순서라 뒤집는다 —
+ * 사용자가 보는 순서와 다르면 "레이어 순서" 라는 이름이 거짓말이 된다.
+ * 부모를 못 찾으면(페이지 직속이 아닌 경우) 0 — 그때는 다른 기준이 순서를 정한다.
+ */
+function layerIndexOf(node: SceneNode): number {
+  const siblings = node.parent?.children
+  if (siblings === undefined) return 0
+  const index = siblings.indexOf(node)
+  return index < 0 ? 0 : siblings.length - 1 - index
+}
+
+/**
+ * 한 번에 이만큼(ms)만 읽고 편집기에 차례를 넘긴다 — 프레임 경계와 무관하게.
+ * 노드 수로 끊으면 텍스트 위주 슬라이드(노드당 읽기 6~7번)와 도형 위주 슬라이드가
+ * 같은 수에 다른 시간을 쓴다. 시간으로 끊어야 한 조각이 화면 한 프레임(16ms) 안에 든다.
+ */
+const SLICE_MS = 8
+
+/** 플러그인 메인은 편집기와 같은 스레드다 — 타이머로 한 번 넘겨야 캔버스가 그려진다 */
+function yieldToEditor(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+/**
+ * 선택 → 폰트·체크리스트 재료·프레임별 집계. 트리는 프레임당 한 번만 걷고, 그 한 번에
+ * 텍스트·폰트·이미지를 다 본다.
+ *
+ * 노드 하나를 읽는 것도 전부 엔진 왕복이라(fills·strokes·effects·absoluteTransform…)
+ * 31장 × 수백 노드를 한 번에 걸으면 캔버스가 초 단위로 멈춘다. 그래서 프레임 단위가
+ * 아니라 **노드 수 단위**로 끊는다 — 큰 슬라이드 한 장도 여러 번에 나눠 걷는다.
+ * 도중에 선택이 바뀌면(isStale) null — 이어 봐야 버려진다. (PRD FR-1)
+ */
+export async function scanSelection(
+  nodes: readonly ExportableNode[],
+  isStale: () => boolean
+): Promise<SelectionScan | null> {
+  const items: FrameItem[] = []
+  const frames: PreflightFrame[] = []
+  const segments: RawFontSegment[] = []
+  const textRejects: TextReject[] = []
+  const slice = { since: Date.now() }
+
+  for (const node of nodes) {
+    const scan = await scanNode(node, slice, isStale)
+    if (scan === null) return null
+    segments.push(...scan.fontSegments)
+    textRejects.push(...scan.textRejects)
+
+    items.push({
+      id: node.id,
+      name: node.name,
+      width: Math.round(node.width),
+      height: Math.round(node.height),
+      x: node.x,
+      y: node.y,
+      layerIndex: layerIndexOf(node),
+      imageCount: new Set(scan.images.map((usage) => usage.imageHash)).size,
+      textCount: scan.textCount
+    })
+
+    // 건너뛸 기준선은 렌더 크기로 센다 — 프레임 자체가 스케일돼 있을 수 있다 (images.ts 와 같은 규칙)
+    const scale = transformScale(node.absoluteTransform)
+    frames.push({
+      id: node.id,
+      longEdge: Math.max(node.width * scale.x, node.height * scale.y),
+      images: scan.images
+    })
+  }
+
+  return { items, fonts: aggregateFontUsage(segments), frames, textRejects }
+}
+
+type Scan = {
+  images: PreflightFrame['images']
+  /** 글자가 있는 텍스트 노드 수. 빈 텍스트는 글리프가 없어 어느 쪽으로도 안 센다. */
+  textCount: number
+  fontSegments: RawFontSegment[]
+  textRejects: TextReject[]
+}
+
+/**
+ * PDF export 는 숨겨진 노드를 빼므로 여기서도 visible=false 는 세지 않는다.
+ * 재귀 대신 스택으로 걷는다 — 조각 시간이 다하면 그 자리에서 멈춰 편집기에 차례를 넘기고
+ * 이어 간다. slice 는 프레임을 넘어 이어지는 시계라 호출자가 들고 있는다.
+ */
+async function scanNode(
+  root: ExportableNode,
+  slice: { since: number },
+  isStale: () => boolean
+): Promise<Scan | null> {
+  const scan: Scan = { images: [], textCount: 0, fontSegments: [], textRejects: [] }
+  // 클립은 내려가면서 좁아진다 — 넘쳐 잘리는 그림을 재려면 지금 어디까지 보이는지 알아야 한다
+  const stack: Array<{ node: SceneNode; clip: Rect | null }> = [
+    { node: root, clip: clipFor(root, null) }
+  ]
+
+  while (stack.length > 0) {
+    if (Date.now() - slice.since >= SLICE_MS) {
+      await yieldToEditor()
+      if (isStale()) return null
+      slice.since = Date.now()
+    }
+
+    const { node: current, clip } = stack.pop() as { node: SceneNode; clip: Rect | null }
+    if (current.visible === false) continue
+
+    if (current.type === 'TEXT' && current.characters !== '') {
+      scan.textCount += 1
+      collectFonts(current, scan.fontSegments)
+      // export 때와 같은 판정을 미리 돌린다 — "왜 아웃라인인지" 를 내보내기 전에 안다
+      const screened = screenTextNode(current, root)
+      if (!screened.ok) {
+        scan.textRejects.push({ nodeId: current.id, name: current.name, reason: screened.reason })
+      }
+    }
+
+    scan.images.push(...imageUsagesOf(current, clip))
+
+    if ('children' in current) {
+      const inner = clipFor(current, clip)
+      // 스택이라 뒤집어 넣어야 문서 순서대로 나온다 (children 도 한 번의 엔진 읽기다)
+      for (let index = current.children.length - 1; index >= 0; index -= 1) {
+        stack.push({ node: current.children[index], clip: inner })
+      }
+    }
+  }
+
+  return scan
+}
+
+/** 한 TextNode 안에서 폰트가 섞여 있을 수 있어 세그먼트 단위로 읽는다. 크기도 같이 — 광학 크기 파일을 고를 때 쓴다 */
+/** 세그먼트 하나가 들고 가는 글자 수 상한 — 폰트별로 다시 합쳐 상한을 둔다 */
+const SEGMENT_CODE_POINT_CAP = 512
+
+function collectFonts(node: TextNode, out: RawFontSegment[]): void {
+  try {
+    for (const segment of node.getStyledTextSegments(['fontName', 'fontSize'])) {
+      out.push({
+        family: segment.fontName.family,
+        style: segment.fontName.style,
+        nodeId: node.id,
+        charCount: segment.characters.length,
+        codePoints: sampleCodePoints(segment.characters, SEGMENT_CODE_POINT_CAP),
+        fontSize: segment.fontSize
+      })
+    }
+  } catch {
+    // 폰트를 못 읽는 노드가 있어도 목록 표시는 계속한다.
+  }
+}
+
+/** 이만큼 읽을 때마다 화면에 중간 결과를 준다 */
+const EDGE_PROGRESS_EVERY = 6
+
+/**
+ * 이미지 해시 → 원본 긴 변(px). 크기를 못 읽은 것은 빠진다.
+ *
+ * 한 장씩 읽고 사이마다 편집기에 차례를 넘기며, 몇 장마다 onProgress 로 그때까지의 답을
+ * 준다 — 캐시에 있던 것은 시작하자마자 한 번 준다. 도중에 선택이 바뀌면 그만둔다.
+ * 읽는 방법은 imageSize.ts — 디코드 없이 파일 머리에서.
+ */
+export async function imageEdges(
+  hashes: Iterable<string>,
+  isStale: () => boolean,
+  onProgress?: (sizes: Record<string, PixelSize>) => void
+): Promise<Record<string, PixelSize>> {
+  const out: Record<string, PixelSize> = {}
+  const missing: string[] = []
+
+  for (const hash of new Set(hashes)) {
+    const cached = knownSize(hash)
+    if (cached !== undefined) out[hash] = cached
+    else missing.push(hash)
+  }
+
+  if (missing.length === 0) return out
+  onProgress?.({ ...out })
+
+  let sinceProgress = 0
+  for (const hash of missing) {
+    if (isStale()) break
+    const image = figma.getImageByHash(hash)
+    if (image !== null) {
+      const size = await readSize(image)
+      if (size !== null) {
+        rememberSize(hash, size)
+        out[hash] = size
+        sinceProgress += 1
+        if (sinceProgress >= EDGE_PROGRESS_EVERY) {
+          sinceProgress = 0
+          onProgress?.({ ...out })
+        }
+      }
+    }
+    await yieldToEditor()
+  }
+
+  void persistEdgeCache()
+  return out
+}
+
+/**
+ * 썸네일을 묶음으로 병렬 렌더. 30장을 하나씩 기다리면 몇 초가 걸리던 일이다.
+ * 도중에 선택이 바뀌었으면(isStale) 남은 것은 그리지 않는다 — 어차피 버려진다.
+ *
+ * 묶음이 끝날 때마다 onBatch 로 넘긴다. 레이어가 수천 개인 문서에서는 exportAsync 한 장이
+ * 그 자체로 느려서, 전부 끝나고 한 번에 보내면 목록이 오래 비어 있다. 그린 것부터 보낸다.
+ */
+export async function renderThumbs(
+  nodes: readonly ExportableNode[],
+  isStale: () => boolean,
+  onBatch?: (batch: Array<{ id: string; thumb: Uint8Array }>) => void
+): Promise<Array<{ id: string; thumb: Uint8Array }>> {
+  const out: Array<{ id: string; thumb: Uint8Array }> = []
+
+  for (let start = 0; start < nodes.length; start += THUMB_CONCURRENCY) {
+    if (isStale()) break
+    const chunk = nodes.slice(start, start + THUMB_CONCURRENCY)
+    const thumbs = await Promise.all(chunk.map(renderThumb))
+    if (isStale()) break
+    const batch: Array<{ id: string; thumb: Uint8Array }> = []
+    chunk.forEach((node, index) => {
+      const thumb = thumbs[index]
+      if (thumb !== null) batch.push({ id: node.id, thumb })
+    })
+    out.push(...batch)
+    if (batch.length > 0 && onBatch !== undefined) onBatch(batch)
+  }
+
+  return out
+}
+
+/**
+ * 썸네일 실패가 목록 표시를 막지 않는다.
+ *
+ * 다만 조용히 삼키지도 않는다 — 실기에서 다섯 장 중 한 장만 빈 칸이 되는 것을 봤는데,
+ * 사유가 남지 않아 무엇이 걸렸는지 알 수 없었다. exportAsync 는 무거운 프레임에서
+ * 간헐적으로 실패하므로 한 번 더 해 보고, 그래도 안 되면 어느 레이어가 왜 실패했는지 남긴다.
+ */
+async function renderThumb(node: ExportableNode): Promise<Uint8Array | null> {
+  const longEdge = Math.max(node.width, node.height)
+  if (longEdge <= 0) return null
+  const scale = Math.min(1, THUMB_LONG_EDGE / longEdge)
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: scale } })
+    } catch (error) {
+      if (attempt === 1) {
+        console.warn(
+          `[Heavyweight] 썸네일 실패: ${node.name} (${node.type}, ${Math.round(node.width)}×${Math.round(node.height)})`,
+          error
+        )
+      }
+    }
+  }
+  return null
+}

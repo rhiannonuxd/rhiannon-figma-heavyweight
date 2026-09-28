@@ -1,0 +1,347 @@
+# Release playbook
+
+**Status: live on the Figma Community** —
+[Featherweight – Compressed PDF Export with Real Fonts](https://www.figma.com/community/plugin/1672509720278498323/featherweight-compressed-pdf-export-with-real-fonts)
+· approved 2026-08-26 · support: featherweight@jangwonseok.com
+
+Repo: [coffeequickly/featherweight](https://github.com/coffeequickly/featherweight) ·
+MIT · plugin id `1672509720278498323`
+
+## Cutting a release
+
+```bash
+npm run lint && npm test && npm run verify:catalog   # verify:catalog hits the network
+npm run install:local                                # load the build into Figma for manual QA
+# work through docs/CHECKLIST.md (Manual QA)
+# for export-pipeline changes, repeat the smoke protocol in docs/EXPORT-PERFORMANCE.md
+npm run package && unzip -l dist/featherweight-*.zip # runtime files only; no development probes
+
+npm version patch                                    # or minor / major
+git push --follow-tags                               # CI builds the GitHub Release + zip
+```
+
+Then publish to the Community (manual, two clicks):
+
+1. Figma desktop → Plugins → Manage plugins → Featherweight → **Publish**
+2. **Publish new version**, add a one-line release note, submit
+
+Version updates skip the full review that the first submission went through.
+Before clicking, run the plugin once and confirm the version in the bottom-right
+corner matches what you intend to ship.
+
+### Two distribution tracks
+
+| Trigger | Result |
+|---|---|
+| Push to `main` | Tests + build, and the rolling `latest` prerelease is refreshed with a fresh zip |
+| Push a `v*` tag | A versioned GitHub Release with `featherweight-X.Y.Z.zip` attached |
+
+The zip is for people who want a development build (unzip → Import plugin from
+manifest). Regular users install from the Community.
+
+Development experiments are welcome in the open-source repository, including
+`tools/pdf-direct-probe/`, but never in the distributed plugin. `npm run package` copies only
+`build/main.js` and `build/ui.js`; if its listing contains another build, stop the release.
+
+## Why Community publishing isn't automated
+
+Figma provides no public API for publishing plugins — submissions go through the
+desktop app. The unofficial path is to call the internal endpoints the desktop
+app uses, authenticating with the `__Host-figma.authn` cookie.
+
+We deliberately don't wire that into CI:
+
+- The cookie **expires**, and there's no way to refresh or rotate it
+  programmatically. Automating it produces a release path that works fine until
+  one day it silently doesn't.
+- It is account-credential-grade. Parking it in CI secrets is a standing risk for
+  what is otherwise a two-click manual step.
+
+`tools/figma-publish.mjs` is kept for the cases where clicking isn't an option,
+and as a starting point if Figma ever ships an official API:
+
+```bash
+# token: figma.com → DevTools → Application → Cookies → __Host-figma.authn
+FIGMA_WEB_AUTHN_TOKEN=... node tools/figma-publish.mjs --dry-run   # inspect only
+FIGMA_WEB_AUTHN_TOKEN=... npm run publish:figma "Fix: ..."         # actually upload
+```
+
+It reuses the listing values (name, description, tags, images) already on the
+store, so this path can't change your listing copy. Copy and image edits happen
+in the desktop app.
+
+## Listing copy
+
+Kept in sync with what's live. Edit here first, then paste into the publish form.
+
+### Name
+
+> Featherweight – Compressed PDF Export with Real Fonts
+
+Community search weighs the plugin name heavily, hence the keywords after the
+brand name (the leading competitor does the same with "(PDF, PNG, JPG, WebP)").
+
+### Tagline
+
+**Hard limit: 100 characters.** The form counts and truncates silently — check
+the counter before saving.
+
+> Real fonts, images sized to what you see, and a size you name. See it all before you export.
+
+93 characters (3.0). The 2.x line ended "…one checklist" — 3.0 replaced the single
+screen with six tabs, so the word stopped being true. The 1.x line was "Name a
+size — say 5MB — and it hits it. Text stays selectable, searchable, ATS-ready."
+(85). None of them repeats "compressed PDF export with real fonts" — the plugin
+*name* already says that, so the tagline spends its budget on what the name can't
+carry.
+
+### Description
+
+Figma's built-in PDF export turns every letter into vector outlines. Your text
+can't be selected, searched, or read by résumé scanners (ATS) — and text-heavy
+documents balloon to 10–20MB that no compressor can shrink, because there are no
+images to compress.
+
+Featherweight fixes the text itself, gets the file down to the size you need —
+and tells you what will happen before you export:
+
+🪶 REAL FONTS, NOT OUTLINES
+Text is re-embedded as real subset fonts — italics included. It stays
+selectable, searchable, copy-pasteable, and ATS-parseable. Inter (Figma's own
+default), Roboto, Pretendard and 57 more are fetched and embedded for you.
+A text-heavy résumé drops from ~10MB to under 1MB.
+
+🪶 SMART IMAGE COMPRESSION
+Images are downscaled to the size they are actually displayed at, then
+re-encoded. Pick a preset — Sharp / Balanced / Smallest / Target — and see the
+exact numbers it sets, or open the Images tab for image size (Largest, Smallest
+and Scale, up to 288 DPI for print) and quality. Every image is listed with its
+visible area, where it starts and the size it ends up, so you can see the setting
+land before you export. A picture that is only partly visible is stored as just
+that visible area when that makes the file smaller. Logos and already-small
+images pass through untouched, so nothing that was sharp gets muddy.
+
+🪶 FIT TO A TARGET SIZE
+Have a 5MB upload limit? Type the number. Featherweight exports once to measure,
+then finds the best image quality that still fits and re-exports at that
+setting. It measures the finished PDF too, and if it came out over the target it
+re-exports with the next candidate. The result card says which settings it chose.
+Quality never drops below a floor — if your target is out of reach it gives you
+the smallest possible file and tells you what that floor is, instead of quietly
+wrecking your images.
+
+🪶 KNOW BEFORE YOU EXPORT
+Six tabs follow the work: Start, Order, Fonts, Images, Options, Result. Start
+shows only what needs you — a missing font, text that would stay outlined and
+why — and a tab turns amber when there is something in it to look at. Follow it,
+or export anyway. No surprises after the fact.
+
+🪶 SEE WHAT YOU SHIPPED
+Result opens on the finished PDF: its first page, its size, how many text layers
+went in with fonts and how many stayed as outlines — each reason clickable to
+find the layer on canvas. It also shows the text a parser will actually read, so
+you can check your name and contact details made it through before you submit.
+
+🪶 FIGMA SLIDES TOO
+Run it in a deck and every slide becomes a page, in deck order — with real fonts
+and downscaled images, where Slides' own PDF export outlines the text and keeps
+every image at full size.
+
+Together these make a real difference: a 12-page portfolio went from 22.7MB
+to 4.0MB with the same pages and the same look.
+
+HOW IT WORKS
+
+1. Select frames and run Featherweight — in Figma Slides, run it with nothing
+   selected to export the whole deck
+2. Pick a preset — or Target, and type the size you need
+3. Check the Start tab; follow a warning to the tab that fixes it
+4. Export — the save dialog is pre-filled with a timestamped file name, and
+   Result tells you what went in
+
+WHAT MAKES IT DIFFERENT
+
+1. 60 open-license font families embed automatically, starting with Inter —
+   Figma's own default — then Roboto, Open Sans, Montserrat, Lato, Poppins and
+   37 more Latin faces, plus 17 Korean ones (Pretendard, Noto Sans KR, Nanum,
+   Gothic A1, Spoqa…). Every weight, roman and italic. For anything else, point
+   it at your font folder once — the matching files (.ttf, .otf and .ttc, macOS
+   and Windows system fonts included) are picked out for you, and the Fonts tab
+   says per font what was found and why it wasn't added.
+2. Never substitutes fonts. Anything it can't embed keeps its original
+   outlines — identical look, honestly reported with a reason you can click
+   to locate the exact layer on canvas.
+3. 100% local. Your document never leaves your machine — network access is
+   used only to download open-license fonts (cdn.jsdelivr.net). No telemetry,
+   no account, no upload.
+4. Free and open source (MIT): github.com/coffeequickly/featherweight
+
+GOOD TO KNOW
+
+1. Always proofread the exported PDF before submitting it anywhere. Text is
+   redrawn with real fonts and may differ subtly from Figma's rendering. You
+   are responsible for the files you produce.
+2. Fonts you add yourself are embedded as-is: static .ttf/.otf files, one per
+   weight, or a .ttc collection (the right face is picked). Variable fonts are
+   skipped — use the static files from the download. A font whose own embedding
+   flag forbids it (the OS/2 "Restricted License" bit, the rule Acrobat and
+   browsers follow) is refused and stays as outlines. That flag is the font's
+   word, not a license review: confirming that your font's license permits
+   document embedding is your responsibility. All auto-downloaded fonts are
+   SIL OFL and permit embedding. Storage for added fonts is 5MB, shared across
+   every file; the Fonts tab shows what is in it and lets you clear it.
+3. Rotated text, gradient/stroke/effect text and underlines keep their
+   original outlines (by design — never silently altered). Start names them
+   before you export.
+4. Text is embedded in an extractable form, but no specific ATS parsing
+   result is guaranteed. Not affiliated with Figma, Inc.
+
+FONT SOURCES & CREDITS
+
+1. Every auto-downloaded font is licensed under the SIL Open Font License 1.1,
+   which permits embedding in documents. The files are the upstream originals —
+   Featherweight does not modify, host or redistribute them; your machine
+   fetches them at export time over the jsDelivr CDN (cdn.jsdelivr.net).
+2. Google Fonts — github.com/google/fonts
+3. Expo Google Fonts — github.com/expo/google-fonts (static builds of families
+   Google now ships variable-only, such as Inter and Noto Sans KR)
+4. Pretendard — github.com/orioncactus/pretendard
+5. Spoqa Han Sans Neo — github.com/spoqa/spoqa-han-sans
+
+Every URL is pinned to a commit or a package version, and verified weekly
+against the real files. Featherweight is not affiliated with, or endorsed by,
+any of these projects. Font names are trademarks of their respective owners.
+
+─────
+한국어 안내
+Figma 기본 PDF 내보내기는 글자를 아웃라인으로 바꿔 선택·검색이 안 되고, 글 위주
+문서는 10~20MB로 불어납니다. Featherweight는 텍스트를 진짜 폰트로 다시 넣고
+(Pretendard·Noto Sans KR·나눔 등 한글 17종 포함 60종 자동), 이미지는 보이는 크기에
+맞춰 줄이고, 목표 용량(예: 5MB)에 맞춰 줍니다. 시작·정렬·폰트·이미지·옵션·결과
+여섯 탭이 작업 순서대로 놓여 있고, 손볼 것이 있는 탭은 색으로 알려 줍니다. 내보낸
+뒤에는 결과 탭이 무엇이 폰트와 함께 들어갔고 무엇이 아웃라인으로 남았는지, 그리고
+파서가 실제로 읽을 텍스트를 보여 줍니다. 문서는 컴퓨터 밖으로 나가지 않습니다.
+무료·오픈소스. 플러그인 화면은 Figma 언어 설정에 따라 한국어로 나옵니다.
+자세한 한국어 안내: github.com/coffeequickly/featherweight#한국어-안내
+
+The Community listing takes one language; this footer is what makes Korean
+searches ("이력서 PDF 용량") hit the page. The full Korean write-up lives in
+README.md under "한국어 안내".
+
+### Categories & tags
+
+Categories (max 2): **Import & export** (primary) + **Design tools**
+
+Tags: `pdf` `export` `fonts` `compress` `slides` `resume` `portfolio` `korean` `ats`
+
+### Media
+
+**Safe area.** The Community carousel crops the sides on mobile — a 1920×960
+board loses roughly 8% off each edge. Keep every word inside the middle **80%
+horizontally and 86% vertically** (that means ~200px side padding on the cover,
+176px on the boards). Check by overlaying a dashed box at `left:10%;right:10%;
+top:7%;bottom:7%` before shipping. This bit us once: the first dark cover had
+96px padding and the logo, "22.7", and the footer URL were all clipped on phones.
+
+
+Stored in `docs/brand/`, all rendered from source so they can be regenerated:
+
+| File | Use |
+|---|---|
+| `icon-128.png` | Plugin icon — the crystal feather, cropped from `src/feather-source.png` |
+| `cover-1920x960.png` | Cover — 22.7MB → 4.0MB with the feather as hero, three feature lines |
+| `media-1.png` | BEFORE YOU EXPORT — "Know before you export." (board-checklist.html, ui-main.png) — first, because it is what changed in 2.0 |
+| `media-2.png` | REAL FONTS — "Real fonts, not outlines." (board-fonts.html, ui-fonts.png) |
+| `media-3.png` | TARGET SIZE — "Name a size. It hits it." (board-target.html, ui-target.png) |
+| `media-4.png` | IMAGE SIZE — "See what your images become." (board-chart.html, ui-images.png) |
+
+All four boards share one grid: brand row, warm-gradient eyebrow, two-line
+headline, gradient bar, one paragraph — and a 470×599 card on the right holding
+a UI capture taken at exactly 440×560 (2×), the plugin window's real size since
+3.0. Keep every capture at that size or the cards stop lining up across the
+carousel.
+
+The 1.x brand board ("Keep text real. Keep files light.") and the editorial
+board with the mock résumé were dropped in 2.0 — they repeated the cover
+without showing the product.
+
+Everything is rendered from source in `docs/brand/src/` (plain HTML + `tokens.css`),
+so any of it can be regenerated or restyled:
+
+```bash
+# 1. UI screenshots → docs/brand/src/ui-{main,target,images,fonts}.png
+npm run ui:preview
+#    all four at w=440&h=560&bare=1, 2× device scale, lang=en-US:
+#    ui-main:     &screen=start&fonts=ready
+#    ui-fonts:    &screen=fonts
+#    ui-target:   &screen=start&fit=1&fonts=ready&text=clean
+#    ui-images:   &screen=images
+#    440×560 is the real window since 3.0 — scaled into the 470px card it lands
+#    at 598px, which is the card's 599px height. Capture at any other size and
+#    the cards stop lining up across the carousel.
+#    3.0 is dark-only, so &theme= no longer does anything.
+
+# 2. render each src/*.html at 1920×960 with headless Chrome
+#    cover.html → cover-1920x960.png, board-*.html → media-1…4.png (order above)
+#    icon.html at 128×128 → icon-128.png
+```
+
+When you replace the cover, bump the `?v=` on the README's image link
+(`docs/brand/cover-1920x960.png?v=2`). GitHub proxies README images and caches
+them by URL, so same-name replacements keep serving the old bytes — the file on
+`raw.githubusercontent.com` updates immediately, the rendered README does not.
+
+No board carries the version number any more (the 1.x brand board did), so a
+release only needs new UI captures when the UI changed.
+
+### The feather
+
+`src/feather-source.png` is the master (a rendered crystal feather on near-black).
+Two derivatives:
+
+- **`src/feather.png`** — same feather with the background knocked out to alpha,
+  for placing on the dark boards. Made by mapping luminance to alpha with an SVG
+  `feColorMatrix`, then screenshotting with
+  `--default-background-color=00000000`. It only works on dark backgrounds: the
+  knockout eats the feather's own dark facets, so on cream it washes out.
+- **`icon-128.png`** — cropped straight from the *source*, background and all.
+  The alpha version loses those dark facets and goes thin at 128px.
+
+**Gradient text.** `.warm` paints type through `background-clip: text`, which
+only fills what sits inside the element's background box. `.num` carries a
+negative `letter-spacing`, which trims the box short of the last glyph and
+shears its right edge off — it ate the B in "4.0MB" once. `.warm` keeps a small
+`padding-right` to cover that; don't remove it, and re-check the last character
+whenever you change letter-spacing.
+
+Palette (`src/tokens.css`): background `#0B0A0C` · warm gradient
+gold `#FFB347` → orange `#F2622A` → magenta `#C2478A` · text `#F6F3EF`.
+The gradient is sampled from the feather, and `.warm` applies it to type.
+
+"Free forever · open source" is called out on the cover and the brand board — it
+is a real differentiator against the paid/subscription plugins in this category.
+
+## Release-note style
+
+Match the existing version history — one line, leading with the change type:
+
+- 3.2: "New: a picture that is only partly visible is stored as just that visible area, when doing so makes the file smaller without losing sharpness anywhere (Options → Trim pictures to the visible area, on by default). Image size is three bars — Largest, Smallest, Scale — with four of your own images drawn above them, and the Images list shows visible area, original, stored size and trimmed share. Target size now measures the finished PDF and re-exports with the next candidate if it came out over, and the result card says which settings it chose."
+- 3.1: "New: bulleted and numbered lists export as real text — the bullet or number is drawn where Figma puts it, so it stays selectable and searchable. Lists in right-to-left scripts keep their outlines."
+- "Fix: the font path 'copy' button didn't respond to clicks at all."
+- "Fix: logos and small images now pass through untouched. UI polish across all tabs."
+- "Windows: correct font folder paths and shortcuts. Locale-aware number formatting."
+- "Feature: Fit to Size — name a target file size and Featherweight finds the best image quality that fits."
+- 2.0: "New: one-screen redesign with a pre-flight checklist — see what shrinks, what's ready and what would be outlined before you export. Find missing fonts in a folder. Presets as tiles; HD/FHD/QHD/4K caps."
+- 2.1: "New: works in Figma Slides — every slide a page, with real fonts and smaller images. Selecting a section exports its frames. Selecting many frames no longer freezes the canvas; image-heavy exports are faster."
+- 2.1.1: "Fix: a font file added by an older version that doesn't match its slot (a variable font, or a different weight) is now flagged before export instead of silently changing the weight."
+- 3.0: "Feature: 3.0 — six tabs, in the order you work: Start, Order, Fonts, Images, Options, Result. Start lists only what needs you, and the tab that fixes it turns amber. Order sorts by canvas position, name or layer order. Fonts groups by family with a page per style and storage you can empty. Images adds 3× and 4× for print (216 and 288 DPI) and lists every image with the size it starts at and the size it ends up. Result opens on the finished PDF — first page, what went in with fonts, what stayed outlined and why, and the text a parser reads. Dark interface, and page thumbnails fill in as they draw instead of all at the end."
+- 2.6.2: "Fix: a font that can't be embedded no longer stops the export — its text is kept as outlines, as it always should have been. Retrying a font that didn't fit can no longer be double-counted, and a folder scan that hits a broken font file keeps going and says what happened."
+- 2.6.1: "Fix: a font whose own license flag forbids embedding (the OS/2 \"Restricted License\" bit — the rule Acrobat and browsers follow) is now refused when added and kept as outlines if it was stored earlier, with the reason shown. Fonts that allow preview-and-print embedding still work."
+- 2.6: "Feature: font collections (.ttc) can be added — macOS system fonts such as Helvetica Neue and Apple SD Gothic Neo, and Windows ones such as Gulim, Batang or Meiryo, are found in your font folder. Google Fonts static files named \"Inter 18pt\" or \"Merriweather 24pt\", and Condensed variants, are matched to the family Figma shows. The Fonts screen keeps the folder-scan result and says per font what was found and why it wasn't added, with Retry once you free storage. Thanks to Robyn for reporting fonts not being found."
+- 2.5: "Fix: superscript/subscript text and numbered or bulleted lists now come out exactly as Figma draws them (kept as outlines, with the reason in the report). Inter is now the 3.19 build Figma bundles, so Inter text matches Figma's widths and weight. Text baselines sit exactly where Figma puts them. Thanks to Gary Butcher for reporting the superscript and list issues."
+- 2.4: "Text now matches Figma's rendering: pair kerning, OpenType features (stylistic sets, kern/liga toggles), mixed fonts in one layer, and glyphs the font lacks are drawn with a fallback font (Inter, then Pretendard for CJK) instead of outlining the layer — the report says which, and it can be turned off. Korean word joiners no longer force outlines."
+- 2.3.3: "Fix: text inside component instances (and groups) no longer pulls its neighbours up when exported — a divider under a heading stayed put in Figma but moved above it in the PDF."
+- 2.3.2: "Fix: fonts you added are stored compressed (about half the space). The Fonts screen is split into sections and lists every stored font with a usage meter — fonts added in other files can be deleted, also from Advanced settings."
+- 2.3: "New: hyperlinks on text stay clickable in the PDF. OTF fonts can be added, not just TTF. Clearer font-folder picker."
+- 2.2: "Target size now uses the whole budget — climbs toward Sharp when Balanced already fits, fine-tunes quality between steps, and predicts from what Figma actually embeds. A 9.5 MB target lands near 8 MB, not 3.5."
+- 2.1.2: "Fix: says plainly what an added font file will do — \"Regular text will export as SemiBold\" — instead of weight numbers."
